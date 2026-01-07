@@ -25,6 +25,12 @@ conda install -c pytorch faiss-cpu -y
 ```
 
 
+## Download and index PubMed baseline
+```shell script
+./build_index.sh
+```
+It will index 26,805,982 PubMed documents.
+
 ## Download data and models
 ```shell script
 ./download_data_models.sh
