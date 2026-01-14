@@ -5,10 +5,10 @@ from torch.utils.data import DataLoader
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 import json
+import argparse
 import random
 from prettytable import PrettyTable
 import re
-from src.util import save_json, load_json
 from sklearn.mixture import BayesianGaussianMixture
 from transformers import DataCollatorWithPadding, AutoModelForSequenceClassification, AutoModel
 from datasets import Dataset
@@ -29,7 +29,16 @@ def set_th_config(seed):
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
 set_th_config(seed_value)
+def load_json(path_from_load):
+    with open(path_from_load, 'r') as rfile:
+        data = json.load(rfile)
+    return data
 
+
+def save_json(data, path_to_save):
+    with open(path_to_save, 'w') as wfile:
+        json.dump(data, wfile, indent=4)
+    print(f"Saved json file as {path_to_save}")
 def extract_label(output, labels):
     cleaned = output.strip().lower()
     cleaned = re.sub(r"[^\w\s]", "", cleaned)
@@ -215,9 +224,26 @@ def retrieve_top_pmids_with_contents(query, top_k=20):
             continue
     return pmids
 
+
 class BioACEEvaluator:
-    def __init__(self, completeness_model_name, completeness_model_dir, nuggets_generation_model_name,
-                 correctness_model_dir, path_to_gmm_config, optimal_threshold, lm_max_seq_length=4096):
+    SUPPORTED_METRICS = {"correctness", "completeness", "precision", "recall"}
+
+    def __init__(
+        self,
+        metrics,
+        completeness_model_name,
+        completeness_model_dir,
+        nuggets_generation_model_name,
+        correctness_model_dir,
+        path_to_gmm_config,
+        optimal_threshold,
+        lm_max_seq_length=4096
+    ):
+        self.metrics = set(metrics)
+        invalid = self.metrics - self.SUPPORTED_METRICS
+        if invalid:
+            raise ValueError(f"Unsupported metrics: {invalid}")
+
 
         self.lm_max_seq_length = lm_max_seq_length
         self.completeness_model_dir = completeness_model_dir
@@ -227,15 +253,39 @@ class BioACEEvaluator:
         self.path_to_gmm_config = path_to_gmm_config
         self.optimal_threshold = optimal_threshold
 
+        self.completeness_model = None
+        self.completeness_tokenizer = None
+        self.correctness_model = None
+        self.correctness_tokenizer = None
+        self.nuggets_generation_model = None
+        self.nuggets_generation_tokenizer = None
+        self.precision_recall_model = None
 
-        self.completeness_model, self.completeness_tokenizer = self.load_completeness_model()
-        self.correctness_model, self.correctness_tokenizer = self.load_correctness_model()
+        self._load_required_models()
 
-        if self.completeness_model_name == self.nuggets_generation_model_name:
-            self.nuggets_generation_model, self.nuggets_generation_tokenizer = self.completeness_model, self.completeness_tokenizer
-        else:
-            self.nuggets_generation_model, self.nuggets_generation_tokenizer = self.load_nuggets_generation_model()
-        self.precision_recall_model = SentenceAlignerEM(path_to_gmm_config, self.optimal_threshold)
+    def _load_required_models(self):
+        if "completeness" in self.metrics:
+            self.completeness_model, self.completeness_tokenizer = self.load_completeness_model()
+
+        if "correctness" in self.metrics:
+            self.correctness_model, self.correctness_tokenizer = self.load_correctness_model()
+
+        if "precision" in self.metrics or "recall" in self.metrics:
+            if self.completeness_model_name == self.nuggets_generation_model_name:
+                self.completeness_model, self.completeness_tokenizer = self.load_completeness_model()
+                self.nuggets_generation_model = self.completeness_model
+                self.nuggets_generation_tokenizer = self.completeness_tokenizer
+            else:
+                self.nuggets_generation_model, self.nuggets_generation_tokenizer = (
+                    self.load_nuggets_generation_model()
+                )
+
+            self.precision_recall_model = SentenceAlignerEM(
+                self.path_to_gmm_config,
+                self.optimal_threshold
+            )
+
+
 
     def load_completeness_model(self):
         model, tokenizer = FastLanguageModel.from_pretrained(
@@ -289,7 +339,7 @@ class BioACEEvaluator:
                 continue
 
             instruction = user_prompt + "\n" + "Question: " + question + "\n" + "Answer: " + answer
-            prompt_text = self.completeness_tokenizer.apply_chat_template([
+            prompt_text = self.nuggets_generation_tokenizer.apply_chat_template([
                 {"role": "system", "content": sys_prompt},
                 {"role": "user", "content": instruction}
             ], tokenize=False, add_generation_prompt=True)
@@ -420,102 +470,171 @@ class BioACEEvaluator:
         question2precision_score, question2recall_score =self.precision_recall_model.get_alignment_performance(data_items, pt_nuggets)
         return question2precision_score, question2recall_score
 
-    def evaluate_all(self, data_items, verbose=True):
-        table = PrettyTable()
-        table.field_names = [
-            "QID",
-            "Correctness",
-            "Completeness",
-            "Precision",
-            "Recall"
-        ]
-        pt_nuggets = self.generate_nuggets(data_items)
+    def evaluate_all(
+            self,
+            data_items,
+            verbose=True,
+            enabled_metrics=("correctness", "completeness", "precision", "recall"),
+            export_results_path="evaluation_results.json"
+    ):
 
-        question2correctness_score = self.evaluate_correctness(data_items)
-        question2comp_score = self.evaluate_completeness(data_items)
-        question2precision_score, question2recall_score = self.evaluate_precision_recall(
-            data_items, pt_nuggets
-        )
+        valid_metrics = {"correctness", "completeness", "precision", "recall"}
+        enabled_metrics = set(enabled_metrics)
 
-        total_questions = len(data_items)
+        invalid = enabled_metrics - valid_metrics
+        if invalid:
+            raise ValueError(f"Invalid metric(s) requested: {invalid}")
 
-        overall_correctness_score = []
-        overall_completeness_score = []
-        overall_precision_score = []
-        overall_recall_score = []
-
-        for item in data_items:
-            qid = item['metadata']['topic_id']
-
-            if qid is None:
-                print("Skipping item with missing qid in data_items")
-                overall_correctness_score.append(0.0)
-                overall_completeness_score.append(0.0)
-                overall_precision_score.append(0.0)
-                overall_recall_score.append(0.0)
-                continue
-
-            missing_sources = []
-
-            if qid not in question2correctness_score:
-                missing_sources.append("correctness")
-            if qid not in question2comp_score:
-                missing_sources.append("completeness")
-            if qid not in question2precision_score:
-                missing_sources.append("precision")
-            if qid not in question2recall_score:
-                missing_sources.append("recall")
-
-            if missing_sources:
-                print(
-                    f"QID {qid} missing in score dict(s): "
-                    f"{', '.join(missing_sources)} — treated as 0"
+        if "precision" in enabled_metrics or "recall" in enabled_metrics:
+            if not hasattr(self, "precision_recall_model"):
+                raise RuntimeError(
+                    "Precision/Recall requested but precision_recall_model is not initialized"
                 )
 
-            c = question2correctness_score.get(qid, 0.0)
-            comp = question2comp_score.get(qid, 0.0)
-            p = question2precision_score.get(qid, 0.0)
-            r = question2recall_score.get(qid, 0.0)
 
-            overall_correctness_score.append(c)
-            overall_completeness_score.append(comp)
-            overall_precision_score.append(p)
-            overall_recall_score.append(r)
+        table = PrettyTable()
+        table.field_names = ["QID"] + [m.capitalize() for m in enabled_metrics]
+
+
+        results = {}
+
+        if "precision" in enabled_metrics or "recall" in enabled_metrics:
+            pt_nuggets = self.generate_nuggets(data_items)
+
+        if "correctness" in enabled_metrics:
+            question2correctness_score = self.evaluate_correctness(data_items)
+        else:
+            question2correctness_score = {}
+
+        if "completeness" in enabled_metrics:
+            question2comp_score = self.evaluate_completeness(data_items)
+        else:
+            question2comp_score = {}
+
+        if "precision" in enabled_metrics or "recall" in enabled_metrics:
+            question2precision_score, question2recall_score = self.evaluate_precision_recall(
+                data_items, pt_nuggets
+            )
+        else:
+            question2precision_score, question2recall_score = {}, {}
+
+
+        total_questions = len(data_items)
+        overall_scores = {m: [] for m in enabled_metrics}
+        per_question_results = {}
+
+        for item in data_items:
+            qid = item["metadata"].get("topic_id")
+
+            if qid is None:
+                print("Skipping item with missing qid")
+                continue
+
+            row = {"QID": qid}
+            per_question_results[qid] = {}
+
+            if "correctness" in enabled_metrics:
+                score = question2correctness_score.get(qid, 0.0)
+                row["Correctness"] = f"{score:.4f}"
+                per_question_results[qid]["correctness"] = score
+                overall_scores["correctness"].append(score)
+
+            if "completeness" in enabled_metrics:
+                score = question2comp_score.get(qid, 0.0)
+                row["Completeness"] = f"{score:.4f}"
+                per_question_results[qid]["completeness"] = score
+                overall_scores["completeness"].append(score)
+
+            if "precision" in enabled_metrics:
+                score = question2precision_score.get(qid, 0.0)
+                row["Precision"] = f"{score:.4f}"
+                per_question_results[qid]["precision"] = score
+                overall_scores["precision"].append(score)
+
+            if "recall" in enabled_metrics:
+                score = question2recall_score.get(qid, 0.0)
+                row["Recall"] = f"{score:.4f}"
+                per_question_results[qid]["recall"] = score
+                overall_scores["recall"].append(score)
 
             if verbose:
-                table.add_row([
-                    qid,
-                    f"{c:.4f}",
-                    f"{comp:.4f}",
-                    f"{p:.4f}",
-                    f"{r:.4f}"
-                ])
+                table.add_row([row[col] for col in table.field_names])
+
+
         if verbose:
             print("\nEvaluation Results")
             print(table)
+
+
+        overall_summary = {}
         print("\n===== OVERALL SCORES =====")
         print(f"Total questions : {total_questions}")
-        print(f"Overall Correctness Score:  {sum(overall_correctness_score) / total_questions:.4f}")
-        print(f"Overall Completeness Score: {sum(overall_completeness_score) / total_questions:.4f}")
-        print(f"Overall Precision Score:    {sum(overall_precision_score) / total_questions:.4f}")
-        print(f"Overall Recall Score:       {sum(overall_recall_score) / total_questions:.4f}")
 
+        for metric, values in overall_scores.items():
+            avg = sum(values) / total_questions if values else 0.0
+            overall_summary[metric] = avg
+            print(f"Overall {metric.capitalize()} Score: {avg:.4f}")
+
+
+        export_payload = {
+            "enabled_metrics": sorted(enabled_metrics),
+            "total_questions": total_questions,
+            "per_question": per_question_results,
+            "overall": overall_summary,
+        }
+
+        save_json(export_payload, export_results_path)
+
+        print(f"\nJSON results written to: {export_results_path}")
         print("Evaluation completed.")
 
 
+
+
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--metrics",
+        nargs="+",
+        default=["correctness", "completeness", "precision", "recall"],
+        choices=["correctness", "completeness", "precision", "recall"],
+        help="Metrics to evaluate"
+    )
+    parser.add_argument("--dataset_path", type=str,
+                        default="../resources/data/task_b_baseline_output.json")
+    parser.add_argument("--lucene_indexer_path", type=str,
+                        default='../resources/data/indexes/pubmed_baseline_collection_jsonl')
+    parser.add_argument("--gt_nugget_path", type=str,
+                        default="../resources/data/task_b_gt_nuggets_first2.json")
+    parser.add_argument("--completeness_model_name", type=str, default='completeness_model')
+    parser.add_argument("--nuggets_generation_model_name", type=str, default='completeness_model')
+    parser.add_argument("--completeness_model_dir", type=str,
+                        default="../resources/models")
+    parser.add_argument("--correctness_model_dir", type=str,
+                        default="../resources/models/correctness_model")
+    parser.add_argument("--path_to_gmm_config", type=str,
+                        default="../resources/models/precision_recall_model/gmm_params.pkl")
+    parser.add_argument("--optimal_threshold", type=float, default=0.6267)
 
-    dataset = load_json("../resources/data/task_b_baseline_output.json")
-    lucene_bm25_searcher = LuceneSearcher('../resources/data/indexes/pubmed_baseline_collection_jsonl')
+    args = parser.parse_args()
 
-    gt_nuggets=load_json("../resources/data/task_b_gt_nuggets_first2.json")
+
+    dataset = load_json(args.dataset_path)
+    lucene_bm25_searcher = LuceneSearcher(args.lucene_indexer_path)
+    gt_nuggets = load_json(args.gt_nugget_path)
+
     evaluator = BioACEEvaluator(
-        completeness_model_name="completeness_model",
-        nuggets_generation_model_name="completeness_model",
-        completeness_model_dir="../resources/models",
-        correctness_model_dir="../resources/models/correctness_model",
-        path_to_gmm_config="../resources/models/precision_recall_model/gmm_params.pkl",
-        optimal_threshold=0.6267
+        metrics=args.metrics,
+        completeness_model_name=args.completeness_model_name,
+        nuggets_generation_model_name=args.nuggets_generation_model_name,
+        completeness_model_dir=args.completeness_model_dir,
+        correctness_model_dir=args.correctness_model_dir,
+        path_to_gmm_config=args.path_to_gmm_config,
+        optimal_threshold=args.optimal_threshold
     )
 
-    evaluator.evaluate_all(dataset)
+    evaluator.evaluate_all(dataset, enabled_metrics=args.metrics,
+                           export_results_path=args.dataset_path.replace(".json", "") + "-results(" + "-".join(
+                               args.metrics) + ").json")
+
+
