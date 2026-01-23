@@ -1,127 +1,174 @@
+import argparse
 import json
+import sys
+
 from scipy.stats import kendalltau, spearmanr
 
-with open("/data/bartelsdp/BioGenExtension/src/data/results/answer_nuggets-document_nuggets/llama3.json") as file:
-    data = json.load(file)
 
-stats = [
-    {
-        "num_coverage": 0,
-        "num_sentences": 0,
-        "num_citations": 0,
-        "num_support": 0,
-        "num_contradict": 0,
-    }
-    for _ in range(30)
-]
+def compute_stats(data):
+    stats = [
+        {
+            "num_coverage": 0,
+            "num_sentences": 0,
+            "num_citations": 0,
+            "num_support": 0,
+            "num_contradict": 0,
+            "citation_coverage": 0.0,
+            "citation_support_rate": 0.0,
+            "citation_contradict_rate": 0.0,
+        }
+        for _ in range(30)
+    ]
 
+    for question in data:
+        if int(question["question_id"]) <= 155:
+            for i in range(30):
+                key = "M" + str(i + 1)
+                m = question.get("machine_generated_answers", {}).get(key, {})
+                answer_sentences = m.get("answer_sentences", [])
 
-for question in data:
-    if int(question["question_id"]) <= 155:
-        for i in range(30):
-            for answer_sentence in question["machine_generated_answers"]["M" + str(i + 1)]["answer_sentences"]:
-                stats[i]["num_sentences"] += 1
-
-                if "labels" in answer_sentence:
+                for answer_sentence in answer_sentences:
+                    stats[i]["num_sentences"] += 1
                     coverage = False
 
-                    for citation in answer_sentence["labels"].values():
-                        stats[i]["num_citations"] += 1
+                    # labels might not be present
+                    if "labels" in answer_sentence and isinstance(answer_sentence["labels"], dict):
+                        for citation in answer_sentence["labels"].values():
+                            stats[i]["num_citations"] += 1
 
-                        if citation.lower().startswith("support"):
-                            stats[i]["num_support"] += 1
-                            coverage = True
+                            if isinstance(citation, str):
+                                lower = citation.lower()
 
-                        elif citation.lower().startswith("contradict"):
-                            stats[i]["num_contradict"] += 1
+                                if lower.startswith("support"):
+                                    stats[i]["num_support"] += 1
+                                    coverage = True
 
-                if coverage:
-                    stats[i]["num_coverage"] += 1
+                                elif lower.startswith("contradict"):
+                                    stats[i]["num_contradict"] += 1
+                                    coverage = True
 
-    else:
-        break
+                            else:
+                                lower = str(citation).lower()
 
-metrics = [
-    {
-        "citation_coverage": 0,
-        "citation_support_rate": 0,
-        "citation_contradict_rate": 0,
-    }
-    for _ in range(30)
-]
+                                if lower.startswith("support"):
+                                    stats[i]["num_support"] += 1
+                                    coverage = True
 
-for i in range(30):
-    if stats[i]["num_sentences"] == 0:
-        metrics[i]["citation_coverage"] = 0
+                                elif lower.startswith("contradict"):
+                                    stats[i]["num_contradict"] += 1
+                                    coverage = True
 
-    else:
-        metrics[i]["citation_coverage"] = stats[i]["num_coverage"] / stats[i]["num_sentences"]
+                    if coverage:
+                        stats[i]["num_coverage"] += 1
+        else:
+            break
 
-    if stats[i]["num_citations"] == 0:
-        metrics[i]["citation_support_rate"] = 0
+    # compute the rate fields
+    for i in range(30):
+        s = stats[i]
 
-    else:
-        metrics[i]["citation_support_rate"] = stats[i]["num_support"] / stats[i]["num_citations"]
+        if s["num_sentences"] == 0:
+            s["citation_coverage"] = 0.0
 
-    if stats[i]["num_citations"] == 0:
-        metrics[i]["citation_contradict_rate"] = 0
+        else:
+            s["citation_coverage"] = s["num_coverage"] / s["num_sentences"]
 
-    else:
-        metrics[i]["citation_contradict_rate"] = stats[i]["num_contradict"] / stats[i]["num_citations"]
+        if s["num_citations"] == 0:
+            s["citation_support_rate"] = 0.0
+            s["citation_contradict_rate"] = 0.0
 
-for i in range(30):
-    print(metrics[i]["citation_support_rate"])
+        else:
+            s["citation_support_rate"] = s["num_support"] / s["num_citations"]
+            s["citation_contradict_rate"] = s["num_contradict"] / s["num_citations"]
 
-fields = [
-    "citation_coverage",
-    "citation_support_rate",
-    "citation_contradict_rate",
-]
+    return stats
 
-rankings = {}
 
-for field in fields:
-    rankings[field + "_ranking"] = sorted(
-        range(30),
-        key=lambda i: metrics[i][field],
-        reverse=True
+def extract_metric_array(stats, metric):
+    """Return list of metric values in order M1..M30."""
+    return [stats[i].get(metric, 0.0) for i in range(30)]
+
+
+def compute_correlations(a, b):
+
+    tau, tau_p = kendalltau(a, b)
+    rho, rho_p = spearmanr(a, b)
+    return (tau, tau_p), (rho, rho_p)
+
+
+def pretty_print_stats(prefix, stats):
+    print(f"--- {prefix} ---")
+    print("Model\tCitation Coverage\tSupport Rate\tContradict Rate")
+    for i in range(30):
+        m = stats[i]
+        print(
+            f"M{i+1}\t{m['citation_coverage']:.4f}\t\t{m['citation_support_rate']:.4f}\t\t{m['citation_contradict_rate']:.4f}"
+        )
+    print()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Compute citation coverage/support/contradict rates correlations."
     )
+    parser.add_argument("file_a", help="Path to first JSON file (run A)")
+    parser.add_argument("file_b", help="Path to second JSON file (run B)")
+    args = parser.parse_args()
 
-print(rankings["citation_coverage_ranking"])
+    # load files
+    try:
+        with open(args.file_a, "r", encoding="utf-8") as f:
+            data_a = json.load(f)
 
-medaesqa_citation_coverage_ranking = [0, 10, 3, 19, 16, 23, 28, 11, 20, 17, 25, 2, 15, 5, 18, 8, 1, 7, 9, 13, 12, 22, 6, 4, 29, 14, 21, 27, 24, 26]
-medaesqa_citation_support_rate_ranking = [25, 5, 18, 10, 15, 0, 6, 3, 19, 11, 1, 28, 13, 2, 17, 8, 20, 23, 9, 7, 16, 12, 4, 29, 14, 21, 22, 27, 24, 26]
-medaesqa_citation_contradict_rate_ranking = [25, 5, 18, 10, 15, 0, 6, 3, 19, 11, 1, 28, 13, 2, 17, 8, 20, 23, 9, 7, 16, 12, 4, 29, 14, 21, 22, 27, 24, 26]
+    except Exception as e:
+        print(f"Failed to load {args.file_a}: {e}", file=sys.stderr)
+        sys.exit(1)
 
-# Kendall's tau
-tau, tau_p = kendalltau(rankings["citation_coverage_ranking"], medaesqa_citation_coverage_ranking)
+    try:
+        with open(args.file_b, "r", encoding="utf-8") as f:
+            data_b = json.load(f)
 
-# Spearman's rho
-rho, rho_p = spearmanr(rankings["citation_coverage_ranking"], medaesqa_citation_coverage_ranking)
+    except Exception as e:
+        print(f"Failed to load {args.file_b}: {e}", file=sys.stderr)
+        sys.exit(1)
 
-print("Citation Coverage")
-print("Spearman's rho:", rho)
-print("Kendall's tau:", tau)
-print()
+    stats_a = compute_stats(data_a)
+    stats_b = compute_stats(data_b)
 
-# Kendall's tau
-tau, tau_p = kendalltau(rankings["citation_support_rate_ranking"], medaesqa_citation_support_rate_ranking)
+    pretty_print_stats("Run A", stats_a)
+    pretty_print_stats("Run B", stats_b)
 
-# Spearman's rho
-rho, rho_p = spearmanr(rankings["citation_support_rate_ranking"], medaesqa_citation_support_rate_ranking)
+    # extract arrays for comparisons
+    cov_a = extract_metric_array(stats_a, "citation_coverage")
+    cov_b = extract_metric_array(stats_b, "citation_coverage")
 
-print("Citation Support Rate")
-print("Spearman's rho:", rho)
-print("Kendall's tau:", tau)
-print()
+    sup_a = extract_metric_array(stats_a, "citation_support_rate")
+    sup_b = extract_metric_array(stats_b, "citation_support_rate")
 
-# Kendall's tau
-tau, tau_p = kendalltau(rankings["citation_contradict_rate_ranking"], medaesqa_citation_contradict_rate_ranking)
+    con_a = extract_metric_array(stats_a, "citation_contradict_rate")
+    con_b = extract_metric_array(stats_b, "citation_contradict_rate")
 
-# Spearman's rho
-rho, rho_p = spearmanr(rankings["citation_contradict_rate_ranking"], medaesqa_citation_contradict_rate_ranking)
+    # compute & print correlations for each metric
+    for name, (arr_a, arr_b) in [
+        ("Citation Coverage", (cov_a, cov_b)),
+        ("Citation Support Rate", (sup_a, sup_b)),
+        ("Citation Contradict Rate", (con_a, con_b)),
+    ]:
+        (tau, tau_p), (rho, rho_p) = compute_correlations(arr_a, arr_b)
 
-print("Citation Contradict Rate")
-print("Spearman's rho:", rho)
-print("Kendall's tau:", tau)
+        print(name)
+        if tau != tau or rho != rho:  # check for NaN
+            print("  Warning: correlation undefined (constant or identical arrays).")
+            print(f"  Kendall's tau: {tau}, p-value: {tau_p}")
+            print(f"  Spearman's rho: {rho}, p-value: {rho_p}")
+        else:
+            print(f"  Kendall's tau: {tau:.6f}, p-value: {tau_p:.6g}")
+            print(f"  Spearman's rho: {rho:.6f}, p-value: {rho_p:.6g}")
+        print()
 
+    # exit normally
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
