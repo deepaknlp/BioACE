@@ -3,8 +3,9 @@ import os
 import json
 import torch
 import transformers
+import argparse
 
-def run_document_evaluation(data):
+def run_document_evaluation(data, abstracts):
     for question in data:
         for i in range(30):
             for answer_sentence in question["machine_generated_answers"]["M" + str(i + 1)]["answer_sentences"]:
@@ -25,10 +26,9 @@ def run_document_evaluation(data):
                             else:
                                 print("PMID " + pmid + " not found")
 
-        with open("data/run6/" + sys.argv[1] + ".json", 'w') as file:
-            json.dump(data, file, indent=4)
+    return data
 
-def run_maxSimSentence_evaluation(data):
+def run_maxSimSentence_evaluation(data, abstracts):
     for question in data:
         for i in range(30):
             for answer_sentence in question["machine_generated_answers"]["M" + str(i + 1)]["answer_sentences"]:
@@ -49,10 +49,9 @@ def run_maxSimSentence_evaluation(data):
                             else:
                                 print("PMID " + pmid + " not found")
 
-        with open("data/run6/" + sys.argv[1] + ".json", 'w') as file:
-            json.dump(data, file, indent=4)
+    return data
 
-def run_nuggets_evaluation(data):
+def run_nuggets_evaluation(data, abstracts):
     messages = []
     prompt = "For the following lists of answer and document nuggets, select one of the following labels:\n\nSupports: There is at least one document nugget that supports/agrees with at least answer nugget and there are no document nuggets that contradict any answer nuggets.\nContradicts: There is at least one document nugget that disagrees with an answer nugget or states its opposite.\nNeutral: The document nuggets are topically relevant, but lack any information to support or contradict any of the answer nuggets.\nNot relevant: The document nuggets are not relevant to the answer nuggets.\nThe response should only include the label.\n\nAnswer Nuggets:\n[sentence]\n\nDocument Nuggets:\n[document]"
 
@@ -127,13 +126,38 @@ def process_data(messages):
 
     return outputs
 
-with open("data/biogen_nuggets.json") as file:
-    data = json.load(file)
 
-with open("data/pmid_nuggets_2.json") as file:
-    abstracts = json.load(file)
+def main():
+    parser = argparse.ArgumentParser(description="Evaluate documents and nuggets using LLM pipeline.")
+    parser.add_argument("data_path", help="Path to input data JSON (the questions/answers file).")
+    parser.add_argument("abstracts_path", help="Path to abstracts JSON (pmid -> nuggets).")
+    parser.add_argument("output_path", help="Path to write the output JSON results.")
+    parser.add_argument("--mode", choices=["nuggets", "document", "maxsim"], default="nuggets",
+                        help="Which evaluation to run. Default: nuggets")
+    args = parser.parse_args()
 
-evals = run_nuggets_evaluation(data)
+    # Load files
+    with open(args.data_path, 'r') as f:
+        data = json.load(f)
 
-with open("data/results/answer_nuggets-document_nuggets/llama3.json", 'w') as file:
-    json.dump(evals, file, indent=4)
+    with open(args.abstracts_path, 'r') as f:
+        abstracts = json.load(f)
+
+    # Run chosen evaluation
+    if args.mode == "nuggets":
+        evals = run_nuggets_evaluation(data, abstracts)
+
+    elif args.mode == "document":
+        evals = run_document_evaluation(data, abstracts)
+
+    elif args.mode == "maxsim":
+        evals = run_maxSimSentence_evaluation(data, abstracts)
+
+    else:
+        raise ValueError("Unknown mode: " + str(args.mode))
+
+    with open(args.output_path, 'w') as file:
+        json.dump(evals, file, indent=4)
+
+if __name__ == "__main__":
+    main()
